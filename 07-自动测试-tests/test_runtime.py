@@ -1,4 +1,5 @@
 import json
+from contextlib import ExitStack
 import sys
 import tempfile
 import unittest
@@ -15,9 +16,9 @@ import run_observation as runner
 
 class RuntimeTests(unittest.TestCase):
     def test_duplicate_and_interrupted_runs(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             store = RunStore(Path(temp) / "runs.db")
-            self.addCleanup(store.close)
+            resources.callback(store.close)
             self.assertTrue(store.begin("day_slot"))
             with self.assertRaises(RuntimeError):
                 store.begin("next_slot")
@@ -29,17 +30,17 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(store.begin("third_slot"))
 
     def test_two_connections_cannot_start_two_runs(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             path = Path(temp) / "runs.db"
             first, second = RunStore(path), RunStore(path)
-            self.addCleanup(first.close)
-            self.addCleanup(second.close)
+            resources.callback(first.close)
+            resources.callback(second.close)
             first.begin("first")
             with self.assertRaises(RuntimeError):
                 second.begin("second")
 
     def test_all_42_slots_and_japan_conversion(self):
-        schedule = json.loads((ROOT / "03-定时任务-routines" / "schedule.json").read_text())
+        schedule = json.loads((ROOT / "03-定时任务-routines" / "schedule.json").read_text(encoding="utf-8"))
         ids = set()
         for day in schedule["planned_trading_dates"]:
             for task in schedule["tasks"]:
@@ -52,31 +53,31 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(runner.due_slot(schedule, datetime.fromisoformat(timestamp).replace(tzinfo=ZoneInfo("America/Chicago"))))
 
     def test_bilingual_schedule_matches(self):
-        en = json.loads((ROOT / "03-定时任务-routines/schedule.json").read_text())
-        zh = json.loads((ROOT / "03-定时任务-routines/schedule.zh-CN.json").read_text())
+        en = json.loads((ROOT / "03-定时任务-routines/schedule.json").read_text(encoding="utf-8"))
+        zh = json.loads((ROOT / "03-定时任务-routines/schedule.zh-CN.json").read_text(encoding="utf-8"))
         for key in ("timezone", "planned_trading_dates", "late_start_grace_minutes", "activation_status"):
             self.assertEqual(en[key], zh[key])
         self.assertEqual([(t["id"], t["time"]) for t in en["tasks"]], [(t["id"], t["time"]) for t in zh["tasks"]])
 
     def test_export_recovery_preserves_portfolio(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as resources:
             root = Path(temp)
             for name in ("05-交易记录-data/journal", "05-交易记录-data/evidence"):
                 (root / name).mkdir(parents=True)
             state_path = root / "05-交易记录-data/current-state.json"
             state_path.write_text(json.dumps({"cash_usdt": 17, "positions": [{"symbol": "EXAMPLE"}]}))
             store = RunStore(root / "runs.db")
-            self.addCleanup(store.close)
+            resources.callback(store.close)
             store.begin("one")
             store.finish("one", {"journal": "one entry", "check": {"checked_at": "2026-09-14T00:00:00+00:00", "stock_etf_access_verified": False}})
             with patch.object(runner, "ROOT", root):
                 runner.export_records(store)
                 runner.export_records(store)
-            state = json.loads(state_path.read_text())
+            state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["cash_usdt"], 17)
             self.assertEqual(state["positions"], [{"symbol": "EXAMPLE"}])
             self.assertNotIn("last_run", state)
-            self.assertEqual(json.loads((root / "05-交易记录-data/last-observation.json").read_text())["run_id"], "one")
+            self.assertEqual(json.loads((root / "05-交易记录-data/last-observation.json").read_text(encoding="utf-8"))["run_id"], "one")
             self.assertEqual(len(list((root / "05-交易记录-data/journal").glob("*.md"))), 1)
 
 

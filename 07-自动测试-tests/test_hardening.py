@@ -1,5 +1,7 @@
 import copy
 import json
+import io
+from contextlib import redirect_stdout
 import os
 import sqlite3
 import subprocess
@@ -14,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "06-程序脚本-scripts"))
 import binance_readiness_check as checker
 import paper_engine
+import run_observation as observation
 import test_paper_ledger as fixtures
 from backup_local import backup_portfolio
 from local_runtime import initialize
@@ -72,7 +75,7 @@ class BoundaryTests(unittest.TestCase):
             (root / "records/id.json").symlink_to(root / "outside.json")
             with self.assertRaises(ValueError):
                 record_path(root / "records", "id", ".json")
-            self.assertEqual((root / "outside.json").read_text(), "keep")
+            self.assertEqual((root / "outside.json").read_text(encoding="utf-8"), "keep")
 
     def test_official_host_allowlist_precedes_network(self):
         for url in ("http://api.binance.com/", "https://api.binance.com.evil.example/", "https://user@api.binance.com/", "https://api.binance.com:443/", "https://example.com/"):
@@ -93,16 +96,34 @@ class BoundaryTests(unittest.TestCase):
             root = Path(temp) / "local"
             initialize(root)
             before = (root / "05-交易记录-data/current-state.json").read_bytes()
-            ready = json.loads((root / "04-运行状态-state/readiness.json").read_text())
+            ready = json.loads((root / "04-运行状态-state/readiness.json").read_text(encoding="utf-8"))
             self.assertFalse(ready["broker_connected"])
             self.assertFalse(ready["autonomous_paper_execution_enabled"])
             self.assertFalse(ready["live_trading_enabled"])
-            schedule = json.loads((root / "03-定时任务-routines/schedule.json").read_text())
+            schedule = json.loads((root / "03-定时任务-routines/schedule.json").read_text(encoding="utf-8"))
             self.assertEqual(schedule["planned_trading_dates"], [])
             self.assertEqual(schedule["activation_status"], "disabled")
             with self.assertRaises(ValueError):
                 initialize(root)
             self.assertEqual(before, (root / "05-交易记录-data/current-state.json").read_bytes())
+
+    def test_observation_reads_chinese_portfolio_as_utf8(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "local"
+            initialize(root)
+            path = root / "05-交易记录-data/current-state.json"
+            state = json.loads(path.read_text(encoding="utf-8"))
+            state["positions"] = [{"symbol": "AAPL", "thesis": "中文模擬策略"}]
+            path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            check = {"checked_at": "2026-09-20T00:00:00+00:00", "stock_etf_access_verified": False, "errors": []}
+            with patch.object(observation, "ROOT", root), patch.object(observation, "load_config", return_value={}), \
+                    patch.object(observation, "check_stocks", return_value=check), \
+                    patch.object(observation, "update_readiness"), patch.object(sys, "argv", ["observe", "--manual"]), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(observation.main(), 2)
+            journals = list((root / "05-交易记录-data/journal").glob("*.md"))
+            self.assertEqual(len(journals), 1)
+            self.assertIn("中文模擬策略", journals[0].read_text(encoding="utf-8"))
 
     def test_cross_process_lock_rejects_second_writer_then_recovers(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -116,7 +137,7 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), "acquired")
 
     def test_cloud_workflow_has_no_runtime_or_secrets(self):
-        workflow = (ROOT / ".github/workflows/paper-trading-observation.yml").read_text()
+        workflow = (ROOT / ".github/workflows/paper-trading-observation.yml").read_text(encoding="utf-8")
         for text in ("secrets.", "upload-artifact", "api.telegram.org", "run_observation.py", "schedule:", "pull_request_target"):
             self.assertNotIn(text, workflow)
         self.assertIn("persist-credentials: false", workflow)
@@ -147,8 +168,8 @@ class LedgerRecoveryTests(unittest.TestCase):
             (data / folder / ("shared_id" + suffix)).write_text("original observation")
         with patch.object(paper_engine, "ROOT", f.root), patch.object(paper_engine, "build_ledger", side_effect=f.make_ledger):
             paper_engine.write_records("shared_id", {"action": "no_trade"}, {"status": "no_trade", "event": None}, f.now)
-        self.assertEqual((data / "evidence/shared_id.json").read_text(), "original observation")
-        self.assertEqual((data / "journal/shared_id.md").read_text(), "original observation")
+        self.assertEqual((data / "evidence/shared_id.json").read_text(encoding="utf-8"), "original observation")
+        self.assertEqual((data / "journal/shared_id.md").read_text(encoding="utf-8"), "original observation")
         self.assertTrue((data / "evidence/paper/shared_id.json").is_file())
         self.assertTrue((data / "journal/paper/shared_id.md").is_file())
 
@@ -173,7 +194,7 @@ class LedgerRecoveryTests(unittest.TestCase):
         restored.reconcile()
         restored.open_long(request, f.now)
         self.assertEqual(len(f.make_ledger().ledger["events"]), 1)
-        exported = json.loads((f.root / "05-交易记录-data/current-state.json").read_text())
+        exported = json.loads((f.root / "05-交易记录-data/current-state.json").read_text(encoding="utf-8"))
         self.assertEqual(exported, f.make_ledger().state)
 
     def test_rejected_exit_does_not_commit_partial_cash_or_position_changes(self):

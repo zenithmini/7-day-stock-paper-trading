@@ -90,7 +90,7 @@ def main():
     group.add_argument("--recover", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    schedule = json.loads((ROOT / "03-定时任务-routines/schedule.json").read_text())
+    schedule = json.loads((ROOT / "03-定时任务-routines/schedule.json").read_text(encoding="utf-8"))
     slot = due_slot(schedule, datetime.now(ZoneInfo("UTC")))
     if args.dry_run:
         print(json.dumps({"due_slot": slot, "planned_slots": len(schedule["planned_trading_dates"]) * len(schedule["tasks"])}))
@@ -115,7 +115,7 @@ def main():
             if not store.begin(run_id):
                 print(json.dumps({"status": "duplicate_skipped", "run_id": run_id}))
                 return 0
-            state = json.loads((ROOT / "05-交易记录-data" / "current-state.json").read_text())
+            state = json.loads((ROOT / "05-交易记录-data" / "current-state.json").read_text(encoding="utf-8"))
             result = check_stocks(load_config(CONFIG))
             update_readiness(result)
             store.finish(run_id, make_payload(run_id, result, state))

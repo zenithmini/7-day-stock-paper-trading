@@ -124,7 +124,7 @@ class PaperLedgerTests(unittest.TestCase):
     def test_open_respects_position_and_trade_limits(self):
         ledger = self.make_ledger()
         event = ledger.open_long(self.request(), self.now)
-        state = json.loads((self.root / "05-交易记录-data/current-state.json").read_text())
+        state = json.loads((self.root / "05-交易记录-data/current-state.json").read_text(encoding="utf-8"))
         position = state["positions"][0]
         self.assertEqual(event["action"], "open_long")
         self.assertLessEqual(Decimal(position["entry_price"]) * Decimal(position["quantity"]), Decimal("1000"))
@@ -172,7 +172,7 @@ class PaperLedgerTests(unittest.TestCase):
         ledger.readiness["binance_stocks_api"]["checked_at"] = stop_time.isoformat()
         stop_quote = self.quote(bid="94.90", ask="95.00", received_at=stop_time)
         event = ledger.mark({"quote": stop_quote}, stop_time, evaluate=True)
-        state = json.loads((self.root / "05-交易记录-data/current-state.json").read_text())
+        state = json.loads((self.root / "05-交易记录-data/current-state.json").read_text(encoding="utf-8"))
         self.assertEqual(event["action"], "close")
         self.assertEqual(event["reason"], "stop")
         self.assertEqual(state["positions"], [])
@@ -196,7 +196,7 @@ class PaperLedgerTests(unittest.TestCase):
 
     def test_reconcile_restores_last_event_snapshot(self):
         self.make_ledger().open_long(self.request(), self.now)
-        damaged = json.loads((self.root / "05-交易记录-data/current-state.json").read_text())
+        damaged = json.loads((self.root / "05-交易记录-data/current-state.json").read_text(encoding="utf-8"))
         damaged["cash_usdt"] = 1
         (self.root / "05-交易记录-data/current-state.json").write_text(json.dumps(damaged), encoding="utf-8")
         restored = self.make_ledger().reconcile()

@@ -74,7 +74,7 @@ class ReadOnlyChecks(unittest.TestCase):
             path.write_text(json.dumps(before))
             with patch.object(checker, "ROOT", root):
                 checker.update_readiness({"signed_account_read_verified": True})
-            after = json.loads(path.read_text())
+            after = json.loads(path.read_text(encoding="utf-8"))
             for key, value in before.items():
                 self.assertEqual(after[key], value)
             self.assertTrue(after["binance_spot_api"]["signed_account_read_verified"])
