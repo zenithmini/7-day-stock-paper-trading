@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "06-程序脚本-scripts"))
 
 from paper_ledger import PaperLedger, PaperLedgerError
+from safety import WRITE_PERMISSIONS
 
 
 class PaperLedgerTests(unittest.TestCase):
@@ -49,6 +50,8 @@ class PaperLedgerTests(unittest.TestCase):
             "binance_stocks_api": {
                 "checked_at": self.now.isoformat(),
                 "stock_etf_access_verified": True,
+                "api_key_permissions_verified": True,
+                "key_permissions": {"enableReading": True, **{key: False for key in WRITE_PERMISSIONS}},
             },
         }
         self.config = {
@@ -203,3 +206,4 @@ class PaperLedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

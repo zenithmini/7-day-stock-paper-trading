@@ -1,139 +1,34 @@
-name: 7-day paper trading observation
+name: Offline safety tests
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
-  schedule:
-    # September 2026 is CDT (UTC-5). The Python runner also checks the
-    # configured trading dates and skips calls outside an allowed window.
-    - cron: "45 12 * * 1-5"
-    - cron: "35 13 * * 1-5"
-    - cron: "0 16 * * 1-5"
-    - cron: "0 18 * * 1-5"
-    - cron: "15 19 * * 1-5"
-    - cron: "45 19 * * 1-5"
 
 permissions:
   contents: read
 
 concurrency:
-  group: paper-trading-observation
-  cancel-in-progress: false
+  group: safety-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  observe:
-    runs-on: ubuntu-latest
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    env:
-      BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-      BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-      BINANCE_ENV: ${{ secrets.BINANCE_ENV }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
     steps:
-      - name: Check out project
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, reviewed ref 2026-09-20
         with:
-          python-version: "3.11"
-
-      - name: Validate required secrets
-        shell: bash
-        run: |
-          if [[ -z "$BINANCE_API_KEY" || -z "$BINANCE_API_SECRET" ]]; then
-            echo "Missing required Binance read-only credentials in GitHub Secrets." >&2
-            exit 1
-          fi
-
-      - name: Create temporary runtime configuration
-        shell: bash
-        run: |
-          umask 077
-          {
-            printf 'BINANCE_API_KEY=%s\n' "$BINANCE_API_KEY"
-            printf 'BINANCE_API_SECRET=%s\n' "$BINANCE_API_SECRET"
-            printf 'BINANCE_ENV=%s\n' "${BINANCE_ENV:-production}"
-          } > 09-API密钥-仅本地/binance-api.env
-
-      - name: Validate project files
-        shell: bash
-        run: |
-          python -m json.tool 03-定时任务-routines/schedule.json >/dev/null
-          python -m json.tool 04-运行状态-state/readiness.json >/dev/null
-          python -m json.tool 05-交易记录-data/current-state.json >/dev/null
-          python 06-程序脚本-scripts/binance_readiness_check.py --check-config
-
-      - name: Run observation
-        id: observation
-        shell: bash
-        run: |
-          set +e
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            python 06-程序脚本-scripts/run_observation.py --manual > observation-output.json
-          else
-            python 06-程序脚本-scripts/run_observation.py > observation-output.json
-          fi
-          run_status=$?
-          set -e
-          python -m json.tool observation-output.json
-          echo "exit_code=$run_status" >> "$GITHUB_OUTPUT"
-          exit "$run_status"
-
-      - name: Write run summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## 7 天股票交易实验"
-            echo
-            echo "- 模式：仅 paper trading / 只读 Binance 验证"
-            echo "- 触发方式：${{ github.event_name }}"
-            echo "- 运行结果：${{ steps.observation.outputs.exit_code || '未执行' }}"
-            echo "- 真实订单：禁止"
-            if [[ -f observation-output.json ]]; then
-              echo
-              echo '```json'
-              python -m json.tool observation-output.json
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Send optional Telegram phone notification
-        if: always()
-        shell: bash
-        run: |
-          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-            echo "Telegram notification is not configured; skipping."
-            exit 0
-          fi
-          result="${{ steps.observation.outputs.exit_code || 'not-run' }}"
-          message="7天股票交易实验：GitHub Actions 已运行。模式=paper trading only，结果码=${result}，真实订单=禁止。详情请查看本次 Actions 记录。"
-          curl --silent --show-error --fail \
-            --request POST \
-            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
-            --data-urlencode "text=$message" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            >/dev/null
-
-      - name: Remove temporary credentials
-        if: always()
-        shell: bash
-        run: |
-          find 09-API密钥-仅本地 -maxdepth 1 -type f -name 'binance-api.env' -delete
-
-      - name: Upload non-secret run records
-        if: always()
-        uses: actions/upload-artifact@v7
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5, reviewed ref 2026-09-20
         with:
-          name: paper-trading-record-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
-          retention-days: 14
-          path: |
-            observation-output.json
-            04-运行状态-state/readiness.json
-            05-交易记录-data/current-state.json
-            05-交易记录-data/journal/*.md
-            05-交易记录-data/evidence/*.json
-            05-交易记录-data/evidence/*.md
+          python-version: '3.12'
+      - name: Install pinned Windows timezone database
+        if: runner.os == 'Windows'
+        run: python -m pip install --disable-pip-version-check tzdata==2025.2
+      - name: Run offline regression tests
+        run: python -B run_tests.py

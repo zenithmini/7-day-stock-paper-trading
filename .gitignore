@@ -14,3 +14,11 @@ observation-output.json
 *.swp
 *.swo
 *~
+
+
+# User runtime, credentials, backups and local exports never belong in Git.
+.local/
+*.sqlite3*
+*.lock
+*.env.bak
+*.env.backup

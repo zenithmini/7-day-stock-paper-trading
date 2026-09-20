@@ -6,12 +6,17 @@ import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
+from urllib.parse import urlencode
+import re
+import sqlite3
+from local_runtime import ROOT
+from safety import process_lock, record_path, validate_run_id
 from zoneinfo import ZoneInfo
 
 from binance_readiness_check import HOSTS, check_stocks, get_json, load_config, update_readiness
 from paper_ledger import PaperLedger, PaperLedgerError, atomic_json, decimal_value
 
-ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "09-API密钥-仅本地" / "binance-api.env"
 
 
@@ -43,14 +48,21 @@ def load_decision(path):
 def fetch_snapshot(config, symbol, now):
     """Read current ordinary-equity rules and quote using GET-only endpoints."""
     symbol = str(symbol).upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,19}", symbol):
+        raise PaperEngineError("Invalid equity symbol")
     headers = {"X-MBX-APIKEY": config["BINANCE_API_KEY"]}
     base = HOSTS["production"]
-    rules_data, error = get_json(base + "/sapi/v1/equity/market/exchangeInfo?symbol=" + symbol, headers)
+    rules_data, error = get_json(base + "/sapi/v1/equity/market/exchangeInfo?" + urlencode({"symbol": symbol}), headers)
     symbols = rules_data.get("symbols") if isinstance(rules_data, dict) else None
     matches = [item for item in symbols if isinstance(item, dict) and item.get("symbol") == symbol] if isinstance(symbols, list) else []
     if not matches:
         raise PaperEngineError("No tradable paper rules for the selected symbol")
-    quote_data, error = get_json(base + "/sapi/v1/equity/market/quote?symbol=" + symbol, headers)
+    quote_started = monotonic()
+    quote_data, error = get_json(base + "/sapi/v1/equity/market/quote?" + urlencode({"symbol": symbol}), headers)
+    latency = monotonic() - quote_started
+    received_at = datetime.now(timezone.utc)
+    if latency > 5:
+        raise PaperEngineError("Quote request exceeded latency limit")
     if not isinstance(quote_data, dict) or quote_data.get("symbol") != symbol:
         raise PaperEngineError("No current paper quote for the selected symbol")
     try:
@@ -72,7 +84,9 @@ def fetch_snapshot(config, symbol, now):
             "ask": str(ask),
             "bid_size": str(bid_size),
             "ask_size": str(ask_size),
-            "received_at": now.isoformat(),
+            "received_at": received_at.isoformat(),
+            "request_seconds": latency,
+            "source_timestamp_verified": False,
         },
     }
 
@@ -91,6 +105,7 @@ def decision_symbol(decision, ledger):
 
 
 def execute(decision, run_id, now=None):
+    validate_run_id(run_id)
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     ledger = build_ledger()
     duplicate = prior_event(ledger, run_id)
@@ -111,8 +126,10 @@ def execute(decision, run_id, now=None):
     ledger = build_ledger()
     ledger.validate_readiness(now)
     snapshot = fetch_snapshot(config, symbol, now)
+    now = datetime.now(timezone.utc)
     action = decision["action"]
     if action == "no_trade":
+        ledger.record_no_trade({"run_id": run_id}, now)
         return {"status": "no_trade", "event": None, "snapshot": snapshot}
     if action == "open_long":
         request = {
@@ -135,6 +152,8 @@ def execute(decision, run_id, now=None):
 
 
 def write_records(run_id, decision, result, now):
+    evidence_path = record_path(ROOT / "05-交易记录-data" / "evidence" / "paper", run_id, ".json")
+    journal_path = record_path(ROOT / "05-交易记录-data" / "journal" / "paper", run_id, ".md")
     ledger = build_ledger()
     local = now.astimezone(ZoneInfo("America/Chicago"))
     state = ledger.state
@@ -151,7 +170,8 @@ def write_records(run_id, decision, result, now):
         "Refresh market evidence and reassess the local paper position at the next scheduled Central-time check. "
         "Live trading remains disabled."
     )
-    atomic_json(ROOT / "05-交易记录-data" / "current-state.json", state)
+    # Observation metadata is separate from the transactional portfolio.
+    atomic_json(ROOT / "05-交易记录-data" / "last-paper-run.json", state["last_run"])
     evidence = {
         "run_id": run_id,
         "timestamp": now.isoformat(),
@@ -161,8 +181,7 @@ def write_records(run_id, decision, result, now):
         "result": result,
         "state": {key: state.get(key) for key in ("cash_usdt", "equity_usdt", "positions", "daily_open_risk_usdt")},
     }
-    atomic_json(ROOT / "05-交易记录-data" / "evidence" / (run_id + ".json"), evidence)
-    journal_path = ROOT / "05-交易记录-data" / "journal" / (local.date().isoformat() + ".md")
+    atomic_json(evidence_path, evidence)
     action = decision["action"]
     event = result.get("event") or {}
     lines = [
@@ -175,11 +194,12 @@ def write_records(run_id, decision, result, now):
         "- Current holdings: " + json.dumps(state.get("positions", []), ensure_ascii=False) + ".",
         "- Current cash: " + str(state.get("cash_usdt")) + " USDT paper cash.",
         "- Current risk: " + str(state.get("daily_open_risk_usdt")) + " USDT open risk.",
-        "- Evidence captured: `05-交易记录-data/evidence/" + run_id + ".json`.",
+        "- Evidence captured: `05-交易记录-data/evidence/paper/" + run_id + ".json`.",
         "- Next task focus: Refresh read-only quote and reassess the paper position or no-trade state.",
         "- Human confirmations needed: None for local paper trading; live trading remains disabled.",
     ]
-    with journal_path.open("a", encoding="utf-8") as file:
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    with journal_path.open("w", encoding="utf-8") as file:
         file.write("\n".join(lines) + "\n")
 
 
@@ -190,17 +210,20 @@ def main():
     args = parser.parse_args()
     now = datetime.now(timezone.utc)
     try:
-        decision = load_decision(args.decision)
-        result = execute(decision, args.run_id, now)
-        write_records(args.run_id, decision, result, now)
+        validate_run_id(args.run_id)
+        with process_lock(ROOT / "runtime.lock"):
+            decision = load_decision(args.decision)
+            result = execute(decision, args.run_id, now)
+            if result["status"] != "duplicate_skipped":
+                write_records(args.run_id, decision, result, now)
         print(json.dumps({"paper_trading": True, "live_order_sent": False, **result}, ensure_ascii=False, indent=2))
         return 0
-    except (OSError, ValueError, PaperLedgerError, PaperEngineError) as exc:
+    except (OSError, ValueError, sqlite3.Error, PaperLedgerError, PaperEngineError):
         print(json.dumps({"paper_trading": True, "live_order_sent": False,
-                          "error": "Paper decision rejected; no broker order was sent.",
-                          "reason": str(exc)}))
+                          "error": "Paper decision incomplete; reconcile local state before retrying with the same run_id. No broker order was sent."}))
         return 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

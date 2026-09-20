@@ -4,10 +4,12 @@
 import argparse
 import json
 from pathlib import Path
+import sqlite3
+from local_runtime import ROOT
+from safety import process_lock
 
 from paper_ledger import PaperLedger, PaperLedgerError
 
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_ledger():
@@ -44,7 +46,7 @@ def main():
             result = ledger.state
         print(json.dumps({"paper_trading": True, "live_order_sent": False, "result": result}, ensure_ascii=False, indent=2))
         return 0
-    except (OSError, ValueError, PaperLedgerError):
+    except (OSError, ValueError, sqlite3.Error, PaperLedgerError):
         print(json.dumps({
             "paper_trading": True,
             "live_order_sent": False,
@@ -55,3 +57,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

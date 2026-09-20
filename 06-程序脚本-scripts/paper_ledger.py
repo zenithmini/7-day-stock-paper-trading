@@ -5,6 +5,9 @@ import copy
 import json
 import os
 import tempfile
+import sqlite3
+from functools import wraps
+from safety import process_lock, read_only_permissions, validate_run_id
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
@@ -60,16 +63,86 @@ def atomic_json(path, payload):
             temporary.unlink()
 
 
+def transactional(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        if self._in_transaction:
+            return method(self, *args, **kwargs)
+        with process_lock(self.ledger_path.parent / "portfolio.lock"):
+            db = self._connect()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                self._load(db)
+                self.readiness = json.loads(self.readiness_path.read_text(encoding="utf-8"))
+                self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+                request = args[0] if args and isinstance(args[0], dict) else kwargs.get("request", {})
+                run_id = request.get("run_id") if isinstance(request, dict) else None
+                if run_id is not None:
+                    validate_run_id(run_id)
+                    prior = next((e for e in self.ledger["events"] if e.get("run_id") == run_id), None)
+                    if prior:
+                        db.rollback()
+                        self._export()
+                        return copy.deepcopy(prior)
+                self._in_transaction = True
+                result = method(self, *args, **kwargs)
+                db.execute("UPDATE portfolio SET state=?, ledger=? WHERE id=1",
+                           (json.dumps(self.state), json.dumps(self.ledger)))
+                db.commit()
+                # JSON is a recoverable export, never the authoritative account state.
+                self._export()
+                return result
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                self._in_transaction = False
+                db.close()
+    return call
+
+
 class PaperLedger:
     def __init__(self, state_path, readiness_path, config_path, ledger_path):
         self.state_path = Path(state_path)
         self.readiness_path = Path(readiness_path)
         self.config_path = Path(config_path)
         self.ledger_path = Path(ledger_path)
-        self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.db_path = self.ledger_path.with_suffix(".sqlite3")
+        self._in_transaction = False
+        with process_lock(self.ledger_path.parent / "portfolio.lock"):
+            db = self._connect()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                self._load(db)
+                db.commit()
+            finally:
+                db.close()
         self.readiness = json.loads(self.readiness_path.read_text(encoding="utf-8"))
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
-        self.ledger = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+
+    def _connect(self):
+        if self.db_path.is_symlink():
+            raise PaperLedgerError("Database cannot be a symbolic link")
+        db = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("CREATE TABLE IF NOT EXISTS portfolio (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL, ledger TEXT NOT NULL)")
+        return db
+
+    def _load(self, db):
+        row = db.execute("SELECT state, ledger FROM portfolio WHERE id=1").fetchone()
+        if row is None:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            ledger = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or not isinstance(ledger, dict) or not isinstance(ledger.get("events"), list):
+                raise PaperLedgerError("Invalid initial portfolio")
+            row = (json.dumps(state), json.dumps(ledger))
+            db.execute("INSERT INTO portfolio VALUES (1,?,?)", row)
+        self.state, self.ledger = map(json.loads, row)
+
+    def _export(self):
+        atomic_json(self.ledger_path, self.ledger)
+        atomic_json(self.state_path, self.state)
 
     def validate_readiness(self, now=None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -90,6 +163,8 @@ class PaperLedger:
         check = self.readiness.get("binance_stocks_api")
         if not isinstance(check, dict) or check.get("stock_etf_access_verified") is not True:
             raise PaperLedgerError("Fresh Binance Stocks read verification is required")
+        if check.get("api_key_permissions_verified") is not True or not read_only_permissions(check.get("key_permissions")):
+            raise PaperLedgerError("Verified read-only API permissions are required")
         checked_at = parse_time(check.get("checked_at"), "readiness.checked_at")
         max_age = decimal_value(self.config["readiness_max_age_hours"], "readiness_max_age_hours")
         age_hours = Decimal(str((now - checked_at).total_seconds())) / Decimal("3600")
@@ -99,7 +174,18 @@ class PaperLedger:
             if key not in self.readiness:
                 raise PaperLedgerError("Missing risk limit: " + key)
 
+    def _roll_day(self, now):
+        day = now.astimezone(ZoneInfo("America/Chicago")).date().isoformat()
+        if self.state.get("pnl_trading_date") != day:
+            self.state["daily_realized_pnl_usdt"] = 0
+            self.state["pnl_trading_date"] = day
+
     def _limits(self):
+        for field, maximum in (("max_position_size_percent", 10), ("max_daily_loss_percent", 2),
+                               ("max_single_trade_loss_percent", "0.5")):
+            value = decimal_value(self.readiness[field], field)
+            if not 0 < value <= Decimal(str(maximum)):
+                raise PaperLedgerError("Risk limit exceeds approved ceiling")
         capital = decimal_value(self.state["starting_capital_usdt"], "starting_capital_usdt")
         return {
             "capital": capital,
@@ -198,13 +284,13 @@ class PaperLedger:
     def _save_event(self, event):
         event["state_after"] = copy.deepcopy(self.state)
         self.ledger.setdefault("events", []).append(event)
-        atomic_json(self.ledger_path, self.ledger)
-        atomic_json(self.state_path, self.state)
 
+    @transactional
     def open_long(self, request, now=None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         self.validate_readiness(now)
         self._assert_entry_window(now)
+        self._roll_day(now)
         if self.state.get("positions"):
             raise PaperLedgerError("Only one active paper position is allowed")
         symbol = str(request.get("symbol", "")).upper()
@@ -301,9 +387,11 @@ class PaperLedger:
         self._save_event(event)
         return event
 
+    @transactional
     def mark(self, request, now=None, evaluate=False):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         self.validate_readiness(now)
+        self._roll_day(now)
         positions = self.state.get("positions", [])
         if len(positions) != 1:
             raise PaperLedgerError("Exactly one active paper position is required")
@@ -322,6 +410,10 @@ class PaperLedger:
         self.state["equity_usdt"] = json_number(equity)
         self.state["unrealized_pnl_usdt"] = json_number(unrealized)
         self.state["daily_open_risk_usdt"] = json_number(open_risk)
+        local = now.astimezone(ZoneInfo("America/Chicago"))
+        if evaluate and self.config.get("allow_overnight") is False and (
+                position["entry_time"][:10] < now.date().isoformat() or local.strftime("%H:%M") >= "14:15"):
+            return self.close({"quote": request["quote"], "reason": "end_of_day", "run_id": request.get("run_id")}, now)
         if evaluate and quote["bid"] <= stop:
             return self.close({"quote": request["quote"], "reason": "stop", "run_id": request.get("run_id")}, now)
         if evaluate and quote["bid"] >= decimal_value(position["target_price"], "target"):
@@ -341,9 +433,11 @@ class PaperLedger:
         self._save_event(event)
         return event
 
+    @transactional
     def close(self, request, now=None):
         now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         self.validate_readiness(now)
+        self._roll_day(now)
         positions = self.state.get("positions", [])
         if len(positions) != 1:
             raise PaperLedgerError("Exactly one active paper position is required")
@@ -395,10 +489,17 @@ class PaperLedger:
         self._save_event(event)
         return event
 
+    @transactional
+    def record_no_trade(self, request, now=None):
+        now = now or datetime.now(timezone.utc)
+        self.validate_readiness(now)
+        event = {"event_id": self._next_id(now) + "-NO-TRADE", "action": "no_trade",
+                 "run_id": validate_run_id(request["run_id"]), "timestamp": now.isoformat(),
+                 "reason": "No paper entry requested", "live_order_sent": False}
+        self._save_event(event)
+        return event
+
+    @transactional
     def reconcile(self):
-        events = self.ledger.get("events", [])
-        if not events or "state_after" not in events[-1]:
-            raise PaperLedgerError("No paper event snapshot is available for reconciliation")
-        self.state = copy.deepcopy(events[-1]["state_after"])
-        atomic_json(self.state_path, self.state)
-        return self.state
+        """Restore both exports from the last committed SQLite snapshot."""
+        return copy.deepcopy(self.state)

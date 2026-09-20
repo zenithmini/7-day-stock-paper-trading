@@ -1,3 +1,21 @@
+# Fork maintenance rules / 本分支維護規則
+
+This fork is a local paper-only research tool. README.md and HARDENING.md describe its current behavior.
+Runtime state and credentials belong only in `.local/`, which must never be committed, uploaded, or placed in CI artifacts.
+GitHub Actions runs offline tests only. Do not add account credentials, cloud account checks or live-order code.
+Use `python -B run_tests.py` after changes to security, persistence or execution behavior.
+The inherited text below describes upstream's historical experiment. Its previous account approvals,
+automation status, paths and autonomous-trading authorizations are not authorization for a new user or this fork.
+No LLM, continuous stop monitor or crypto-market service is implemented in this hardening release.
+
+本分支只做本機模擬研究；原作者的帳戶驗證與排程不代表本使用者已授權或已設定。
+個人設定、密鑰、帳本及備份放在 `.local/`，GitHub 只執行離線測試。
+任何涉及安全與帳本的修改都必須執行上述回歸測試。以 README.md 的現行說明為準。
+
+---
+
+## Historical upstream instructions / 上游歷史規則
+
 # AI Trading Experiment Operating Rules
 
 This project is a 7 trading day stock/ETF research and paper trading experiment.
@@ -80,3 +98,4 @@ Each journal entry must state:
 - `06-程序脚本-scripts/run_observation.py` is read-only. `06-程序脚本-scripts/paper_engine.py` may simulate local paper fills only; it has no broker POST path.
 - The approved local paper rules enforce one position, 10% maximum notional, 0.5% maximum planned loss, two evidence categories, 1.5 net reward/risk, no new entry after 11:30 Central, and no overnight position.
 - Preserve both languages. Dates in the schedule are provisional until authentication and review pass; do not count setup days as experiment sessions.
+

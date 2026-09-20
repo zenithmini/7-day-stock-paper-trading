@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from safety import validate_run_id
 from datetime import datetime, timezone
 
 
@@ -23,6 +24,7 @@ class RunStore:
         self.db.close()
 
     def begin(self, run_id):
+        validate_run_id(run_id)
         self.db.execute("BEGIN IMMEDIATE")
         try:
             if self.db.execute("SELECT 1 FROM runs WHERE status='running'").fetchone():
@@ -52,3 +54,4 @@ class RunStore:
     def completed(self):
         return [(run_id, json.loads(payload)) for run_id, payload in self.db.execute(
             "SELECT run_id,payload FROM runs WHERE status='complete' ORDER BY started_at,run_id")]
+

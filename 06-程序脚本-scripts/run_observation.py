@@ -2,7 +2,9 @@
 """Six-slot, read-only runner with locking, duplicate prevention and export recovery."""
 
 import argparse
-import fcntl
+import sqlite3
+from safety import process_lock, record_path, validate_run_id
+from local_runtime import PROJECT
 import json
 import os
 import tempfile
@@ -51,19 +53,15 @@ def export_records(store):
     # Export deterministic per-run files; replay after a crash cannot duplicate entries.
     records = store.completed()
     for run_id, payload in records:
-        atomic_write(ROOT / "05-交易记录-data" / "journal" / (run_id + ".md"), payload["journal"])
-        atomic_write(ROOT / "05-交易记录-data" / "evidence" / (run_id + ".json"), json.dumps(payload["check"], indent=2) + "\n")
-    # Portfolio JSON remains authoritative; run recovery never rolls it backwards.
+        atomic_write(record_path(ROOT / "05-交易记录-data" / "journal", run_id, ".md"), payload["journal"])
+        atomic_write(record_path(ROOT / "05-交易记录-data" / "evidence", run_id, ".json"), json.dumps(payload["check"], indent=2) + "\n")
     if records:
         run_id, payload = records[-1]
-        path = ROOT / "05-交易记录-data" / "current-state.json"
-        state = json.loads(path.read_text())
-        latest = state.get("last_run") or {}
-        timestamp = payload["check"]["checked_at"]
-        if latest.get("timestamp", "") <= timestamp:
-            state["last_run"] = {"run_id": run_id, "timestamp": timestamp, "mode": "observation_only",
-                                 "stock_api_verified": payload["check"].get("stock_etf_access_verified", False), "orders_placed": False}
-            atomic_write(path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        atomic_write(ROOT / "05-交易记录-data" / "last-observation.json", json.dumps({
+            "run_id": run_id, "timestamp": payload["check"]["checked_at"],
+            "stock_api_verified": payload["check"].get("stock_etf_access_verified", False),
+            "orders_placed": False,
+        }, indent=2) + "\n")
 
 
 def make_payload(run_id, check, state):
@@ -97,15 +95,10 @@ def main():
     if args.dry_run:
         print(json.dumps({"due_slot": slot, "planned_slots": len(schedule["planned_trading_dates"]) * len(schedule["tasks"])}))
         return 0
-    if not args.manual and not args.recover and slot is None:
+    if not args.manual and not args.recover and (schedule.get("activation_status") != "enabled" or slot is None):
         print(json.dumps({"status": "outside_scheduled_window"}))
         return 0
-    with (ROOT / "04-运行状态-state" / "run.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(json.dumps({"status": "another_run_active"}))
-            return 0
+    with process_lock(ROOT / "runtime.lock"):
         store = RunStore(ROOT / "05-交易记录-data" / "runs.sqlite3")
         try:
             export_records(store)
@@ -114,7 +107,7 @@ def main():
                 print(json.dumps({"interrupted_runs_recorded": count, "exports_restored": True}))
                 return 0
             for name in STARTUP:
-                (ROOT / name).read_text(encoding="utf-8")
+                (PROJECT / name).read_text(encoding="utf-8")
             journals = sorted((ROOT / "05-交易记录-data" / "journal").glob("*.md"), key=lambda p: p.stat().st_mtime)
             if journals:
                 journals[-1].read_text(encoding="utf-8")
@@ -136,6 +129,7 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
         print(json.dumps({"error": "Observation incomplete; inspect local state and use --recover before next run"}))
         raise SystemExit(4)
+

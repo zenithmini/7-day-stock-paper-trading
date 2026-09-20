@@ -75,9 +75,11 @@ class RuntimeTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             self.assertEqual(state["cash_usdt"], 17)
             self.assertEqual(state["positions"], [{"symbol": "EXAMPLE"}])
-            self.assertEqual(state["last_run"]["run_id"], "one")
+            self.assertNotIn("last_run", state)
+            self.assertEqual(json.loads((root / "05-交易记录-data/last-observation.json").read_text())["run_id"], "one")
             self.assertEqual(len(list((root / "05-交易记录-data/journal").glob("*.md"))), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -11,10 +11,11 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-ROOT = Path(__file__).resolve().parents[1]
+from local_runtime import ROOT
+from safety import read_only_permissions, process_lock
 CONFIG = ROOT / "09-API密钥-仅本地" / "binance-api.env"
 HOSTS = {
     "production": "https://api.binance.com",
@@ -28,6 +29,10 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 def load_config(path):
+    if path.is_symlink():
+        raise ValueError("Credential file cannot be a symbolic link")
+    if os.name != "nt" and path.stat().st_mode & 0o077:
+        raise ValueError("Credential file must have owner-only permissions (chmod 600)")
     values = {}
     for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw.strip()
@@ -50,11 +55,17 @@ def load_config(path):
 
 
 def get_json(url, headers=None):
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.netloc not in {"api.binance.com", "testnet.binance.vision"}
+            or parsed.username or parsed.password or parsed.fragment):
+        raise ValueError("Only official Binance HTTPS hosts are allowed")
     # Fixed official hosts and no redirects prevent credential forwarding.
     req = Request(url, headers={"User-Agent": "binance-spot/1.0.1 (Skill)", **(headers or {})}, method="GET")
     try:
         with build_opener(NoRedirect()).open(req, timeout=10) as response:
-            body = response.read()
+            body = response.read(2_000_001)
+            if len(body) > 2_000_000:
+                return None, "Response exceeds size limit"
             if not body:
                 return None, "No data available"
             data = json.loads(body)
@@ -65,7 +76,7 @@ def get_json(url, headers=None):
         # Only a numeric API error code is safe to export, never raw server text.
         suffix = ""
         try:
-            body = json.loads(exc.read())
+            body = json.loads(exc.read(8192))
             code = body.get("code") if isinstance(body, dict) else None
             if type(code) is int:
                 suffix = " / Binance %d" % code
@@ -107,6 +118,14 @@ def check(config, public_only=False):
         if not key or not secret:
             result["errors"].append("Fill both credentials in 09-API密钥-仅本地/binance-api.env locally")
         elif result["public_api_reachable"]:
+            if env != "production":
+                result["errors"].append("Read-only key permissions cannot be verified on Spot testnet")
+                return result
+            permissions, error = signed_get(config, "/sapi/v1/account/apiRestrictions")
+            result["api_key_permissions_verified"] = read_only_permissions(permissions)
+            if not result["api_key_permissions_verified"]:
+                result["errors"].append("api_permissions: Verified read-only key required")
+                return result
             query = urlencode({"timestamp": stamp, "recvWindow": 5000})
             signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
             account, error = get_json(
@@ -144,7 +163,8 @@ def valid_quote(quote, symbol):
 
 
 def check_stocks(config, public_only=False, symbol="AAPL"):
-    result = check(config, public_only=public_only)
+    # Establish public connectivity without reading any account balances first.
+    result = check(config, public_only=True)
     result.update({"scope": "stocks", "stock_rules_read_verified": False,
                    "stock_quote_read_verified": False, "stock_orders_read_verified": False,
                    "quote_freshness_verified": False, "stock_symbol": symbol})
@@ -154,6 +174,14 @@ def check_stocks(config, public_only=False, symbol="AAPL"):
         result["errors"].append("Stocks sandbox is not verified; Spot testnet cannot verify Stocks")
         return result
     if not result["credentials_present"] or not result["public_api_reachable"]:
+        return result
+    permissions, error = signed_get(config, "/sapi/v1/account/apiRestrictions")
+    result["api_key_permissions_verified"] = read_only_permissions(permissions)
+    if isinstance(permissions, dict):
+        result["key_permissions"] = {k: v for k, v in permissions.items()
+                                     if type(v) is bool and (k.startswith(("enable", "permits")) or k == "ipRestrict")}
+    if not result["api_key_permissions_verified"]:
+        result["errors"].append("api_permissions: Read-only permissions are missing, enabled for writes, or unverified")
         return result
     headers = {"X-MBX-APIKEY": config["BINANCE_API_KEY"]}
     rules, error = get_json(HOSTS["production"] + "/sapi/v1/equity/market/exchangeInfo?" + urlencode({"symbol": symbol}), headers)
@@ -170,8 +198,9 @@ def check_stocks(config, public_only=False, symbol="AAPL"):
     if result["stock_quote_read_verified"]:
         result["quote"] = {k: quote[k] for k in ("symbol", "bidPrice", "askPrice")}
         result["quote_received_at"] = datetime.now(timezone.utc).isoformat()
-        # Binance documents this latest quote as at most about five seconds stale.
-        result["quote_freshness_verified"] = True
+        # A documented cache interval is not a verified market-event timestamp.
+        result["quote_freshness_verified"] = False
+        result["quote_response_received"] = True
     else:
         result["errors"].append("stock_quote: " + (error or "Invalid quote"))
     orders, error = signed_get(config, "/sapi/v1/equity/order/open-orders")
@@ -179,15 +208,8 @@ def check_stocks(config, public_only=False, symbol="AAPL"):
         isinstance(order, dict) and isinstance(order.get("orderId"), str) for order in orders)
     if not result["stock_orders_read_verified"]:
         result["errors"].append("stock_orders: " + (error or "Unexpected response"))
-    permissions, error = signed_get(config, "/sapi/v1/account/apiRestrictions")
-    result["api_key_permissions_verified"] = isinstance(permissions, dict) and type(permissions.get("enableReading")) is bool
-    if result["api_key_permissions_verified"]:
-        result["key_permissions"] = {k: v for k, v in permissions.items()
-                                     if k in {"enableReading", "enableWithdrawals", "enableSpotAndMarginTrading", "ipRestrict"} and type(v) is bool}
-    else:
-        result["errors"].append("api_permissions: " + (error or "Unexpected response"))
     result["stock_etf_access_verified"] = all(result[k] for k in (
-        "stock_rules_read_verified", "stock_quote_read_verified", "stock_orders_read_verified"))
+        "api_key_permissions_verified", "stock_rules_read_verified", "stock_quote_read_verified", "stock_orders_read_verified"))
     return result
 
 
@@ -228,7 +250,8 @@ def main():
             return 0 if present else 2
         result = (check if args.spot_only else check_stocks)(config, public_only=args.public_only)
         if args.update_readiness:
-            update_readiness(result)
+            with process_lock(ROOT / "runtime.lock"):
+                update_readiness(result)
         print(json.dumps(result, indent=2))
         if not result["public_api_reachable"]:
             return 3
@@ -241,3 +264,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
