@@ -118,7 +118,7 @@ class CryptoReportTests(unittest.TestCase):
 
     def test_exports_refuse_overwrite_and_bad_paths(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "research"
+            root = Path(temp).resolve() / "research"
             paths = cli.write_bundle("reports", "report01", {".json": "safe"}, root)
             with self.assertRaises(ValueError):
                 cli.write_bundle("reports", "report01", {".json": "changed"}, root)
@@ -133,7 +133,8 @@ class CryptoReportTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "Creating symlinks may require Windows developer mode")
     def test_export_rejects_symlinked_ancestor(self):
         with tempfile.TemporaryDirectory() as temp:
-            directory = Path(temp)
+            # Resolve macOS's system /var alias before creating our intentional symlink.
+            directory = Path(temp).resolve()
             (directory / "outside").mkdir()
             (directory / "alias").symlink_to(directory / "outside", target_is_directory=True)
             with self.assertRaises(ValueError):
@@ -141,7 +142,7 @@ class CryptoReportTests(unittest.TestCase):
             self.assertEqual(list((directory / "outside").iterdir()), [])
 
     def test_cli_demo_manual_import_and_comparison_are_offline(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(cli, "LOCAL_ROOT", Path(temp) / "research"), \
+        with tempfile.TemporaryDirectory() as temp, patch.object(cli, "LOCAL_ROOT", Path(temp).resolve() / "research"), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["demo", "--run-id", "demo01"]), 0)
             report = cli.LOCAL_ROOT / "reports/demo01.json"
