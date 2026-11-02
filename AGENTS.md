@@ -6,9 +6,12 @@ GitHub Actions runs offline tests only. Do not add account credentials, cloud ac
 Use `python -B run_tests.py` after changes to security, persistence or execution behavior.
 The inherited text below describes upstream's historical experiment. Its previous account approvals,
 automation status, paths and autonomous-trading authorizations are not authorization for a new user or this fork.
-crypto_research provides offline backtests, manual ChatGPT report exchange and optional local Ollama research proposals.
+crypto_research provides bounded public history downloads, chronological studies, offline backtests,
+local HTML research reports, manual ChatGPT exchange and optional local Ollama research proposals.
 Model output may only become a bounded research candidate; never execute model code, commands or orders.
-Candidate comparisons cannot promote strategies. No continuous stop monitor, crypto-market service or cloud API is implemented.
+Candidate comparisons cannot promote strategies. The CLI claims each holdout before evaluation;
+never remove claims to retune against already viewed data. History download has no account access.
+No continuous stop monitor, 24-hour market service or cloud AI API is implemented.
 
 本分支只做本機模擬研究；原作者的帳戶驗證與排程不代表本使用者已授權或已設定。
 個人設定、密鑰、帳本及備份放在 `.local/`，GitHub 只執行離線測試。

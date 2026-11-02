@@ -4,10 +4,13 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from pathlib import Path
 
 from .backtest import run_backtest
 from .contracts import DEFAULT_PARAMETERS, canonical_sha256, validate_dataset, validate_identifier
+from .market_data import MarketDataError
 from .reports import (
     build_report, candidate_parameters, proposal_template, render_markdown,
     validate_proposal, validate_report,
@@ -19,6 +22,12 @@ sys.path.insert(0, str(PROJECT / "06-程序脚本-scripts"))
 from safety import process_lock
 
 MAX_INPUT_BYTES = 32 * 1024 * 1024
+OUTPUT_KINDS = {"datasets", "reports", "candidates", "comparisons", "studies", "validations", "holdouts"}
+OUTPUT_SUFFIXES = {".json", ".md", ".html", ".proposal-template.json", ".source.json", ".result.json", ".claim.json"}
+
+
+class ResearchWorkflowError(ValueError):
+    """An actionable workflow message which contains no server or model output."""
 
 
 def _pairs(pairs):
@@ -51,7 +60,7 @@ def load_json(path):
 
 
 def ensure_directory(kind, root=None):
-    if kind not in {"datasets", "reports", "candidates", "comparisons"}:
+    if kind not in OUTPUT_KINDS:
         raise ValueError("Unsupported research output directory")
     root = Path(root) if root is not None else LOCAL_ROOT
     # Check existing ancestors before mkdir, including a symlinked .local folder.
@@ -67,31 +76,46 @@ def ensure_directory(kind, root=None):
 
 def write_bundle(kind, identifier, contents, root=None):
     """Exclusive, locked exports. Refuse overwrites and remove partial packets."""
-    validate_identifier(identifier)
-    if not isinstance(contents, dict) or not contents or any(
-        suffix not in {".json", ".md", ".proposal-template.json", ".source.json", ".result.json"}
-        or not isinstance(value, str) for suffix, value in contents.items()
-    ):
-        raise ValueError("Unsupported research file bundle")
-    directory = ensure_directory(kind, root)
-    paths = {suffix: directory / (identifier + suffix) for suffix in contents}
+    return write_packet_groups([(kind, identifier, contents)], root)[0]
+
+
+def write_packet_groups(groups, root=None):
+    """Export related study/report files together, under the existing writer lock."""
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("A research export requires at least one packet")
+    # Validate all identifiers and suffixes before creating any output directories.
+    for kind, identifier, contents in groups:
+        validate_identifier(identifier)
+        if kind not in OUTPUT_KINDS or not isinstance(contents, dict) or not contents or any(
+            suffix not in OUTPUT_SUFFIXES or not isinstance(value, str) for suffix, value in contents.items()
+        ):
+            raise ValueError("Unsupported research file bundle")
+    packet_paths, writes = [], {}
+    for kind, identifier, contents in groups:
+        directory = ensure_directory(kind, root)
+        paths = {suffix: directory / (identifier + suffix) for suffix in contents}
+        packet_paths.append(paths)
+        for suffix, path in paths.items():
+            if path in writes:
+                raise ValueError("Research packets cannot write to the same path")
+            writes[path] = contents[suffix]
     created = []
     with process_lock(directory.parent / "research.lock"):
-        if any(path.exists() or path.is_symlink() for path in paths.values()):
+        if any(path.exists() or path.is_symlink() for path in writes):
             raise ValueError("Research identifier already exists; use a new identifier")
         try:
-            for suffix, path in paths.items():
+            for path, content in writes.items():
                 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 created.append(path)
                 with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                    handle.write(contents[suffix])
+                    handle.write(content)
                     handle.flush()
                     os.fsync(handle.fileno())
         except BaseException:
             for path in created:
                 path.unlink(missing_ok=True)
             raise
-    return paths
+    return packet_paths
 
 
 def _json(value):
@@ -154,13 +178,103 @@ def compare_candidate(dataset, report, proposal):
     }
 
 
+def parse_utc_date(value):
+    """The CLI deliberately accepts unambiguous UTC date boundaries only."""
+    if not isinstance(value, str) or len(value) != 10:
+        raise ResearchWorkflowError("Use a date in YYYY-MM-DD format; boundaries are UTC.")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if parsed.strftime("%Y-%m-%d") != value:
+            raise ValueError("Noncanonical date")
+        return int(parsed.timestamp())
+    except (ValueError, OverflowError, OSError):
+        raise ResearchWorkflowError("Use a valid UTC date in YYYY-MM-DD format.") from None
+
+
+def save_study(dataset, parameters, identifier, provenance=None):
+    from .validation import prepare_study
+    from .study_view import render_study_html
+    study = prepare_study(dataset, parameters, identifier)
+    report = study["train_report"]
+    packets = [
+        ("studies", identifier, {".json": _json(study)}),
+        ("reports", report["report_id"], {
+            ".json": _json(report), ".md": render_markdown(report), ".html": render_study_html(study),
+            ".proposal-template.json": _json(proposal_template(report)),
+        }),
+    ]
+    if provenance is not None:
+        packets.append(("datasets", dataset["dataset_id"], {".json": _json(dataset), ".source.json": _json(provenance)}))
+    paths = write_packet_groups(packets)
+    output = {"study": paths[0][".json"], "train_report": paths[1][".json"],
+              "chatgpt_prompt": paths[1][".md"], "viewer": paths[1][".html"],
+              "proposal_template": paths[1][".proposal-template.json"]}
+    if provenance is not None:
+        output.update(dataset=paths[2][".json"], provenance=paths[2][".source.json"])
+    return study, output
+
+
+def recent_utc_window(days, now=None):
+    if type(days) is not int or not 7 <= days <= 365:
+        raise ResearchWorkflowError("Research history must contain 7-365 complete UTC days.")
+    now = now if now is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ResearchWorkflowError("Research date requires a timezone.")
+    end = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((end - timedelta(days=days)).timestamp()), int(end.timestamp())
+
+
+def open_local_report(path):
+    import webbrowser
+    try:
+        if webbrowser.open(path.resolve().as_uri()):
+            return
+    except (OSError, ValueError):
+        pass
+    print("The report is saved. Open the generated .html file manually if no browser appeared.", file=sys.stderr)
+
+
+def holdout_once(dataset, study, proposal, validation_record):
+    """Consume a local holdout claim before evaluating any holdout prices."""
+    from .validation import holdout_comparison, validate_study, validation_comparison
+    study = validate_study(study, dataset)
+    # This recomputation only examines the training and validation stages.
+    expected_validation = validation_comparison(dataset, study, proposal)
+    if canonical_sha256(validation_record) != canonical_sha256(expected_validation):
+        raise ResearchWorkflowError("Validation record does not match this study and fixed candidate.")
+    key = study["holdout_key"]
+    directory = ensure_directory("holdouts")
+    claim_path = directory / (key + ".claim.json")
+    result_path = directory / (key + ".json")
+    if any(path.exists() or path.is_symlink() for path in (claim_path, result_path)):
+        raise ResearchWorkflowError("This holdout has already been claimed. It cannot be tested again through this workflow.")
+    claim = {
+        "schema_version": 1, "holdout_key": key, "study_id": study["study_id"],
+        "study_sha256": study["study_sha256"], "proposal_sha256": canonical_sha256(proposal),
+        "validation_sha256": canonical_sha256(validation_record),
+        "claimed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "consumed_before_evaluation", "promotion_allowed": False,
+    }
+    # Exclusive creation under the shared OS lock prevents two workers from peeking.
+    write_bundle("holdouts", key, {".claim.json": _json(claim)})
+    try:
+        result = holdout_comparison(dataset, study, proposal)
+        output = {"schema_version": 1, "promotion_allowed": False, "claim": claim, "evaluation": result}
+        paths = write_bundle("holdouts", key, {".json": _json(output)})
+    except (ValueError, OSError, TypeError, KeyError, OverflowError, RecursionError):
+        raise ResearchWorkflowError(
+            "Holdout claim was saved, but evaluation/export failed. The claim remains consumed; do not retune on this holdout."
+        ) from None
+    return output, paths
+
+
 def _paths(paths):
     # JSON-escaped output also works with restricted Windows console encodings.
     print(json.dumps({suffix: str(path) for suffix, path in paths.items()}, ensure_ascii=True))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Crypto research only; no broker or cloud API")
+    parser = argparse.ArgumentParser(description="Crypto history and research; no broker or cloud AI API")
     commands = parser.add_subparsers(dest="command", required=True)
     demo = commands.add_parser("demo", help="Run an artificial, offline demonstration")
     demo.add_argument("--run-id", default="demo01")
@@ -179,6 +293,33 @@ def main(argv=None):
     compare.add_argument("--report", required=True)
     compare.add_argument("--proposal", required=True)
     compare.add_argument("--run-id", required=True)
+    history = commands.add_parser("history", help="Download closed historical bars from Binance's public data service")
+    history.add_argument("--symbol", required=True)
+    history.add_argument("--interval", choices=("1m", "5m", "15m", "1h"), default="15m")
+    history.add_argument("--start", required=True, help="Inclusive UTC date YYYY-MM-DD")
+    history.add_argument("--end", required=True, help="Exclusive UTC date YYYY-MM-DD")
+    history.add_argument("--run-id", required=True)
+    start = commands.add_parser("start-study", help="Download recent public history, prepare a study and show a local training report")
+    start.add_argument("--symbol", default="BTCUSDT")
+    start.add_argument("--interval", choices=("1m", "5m", "15m", "1h"), default="15m")
+    start.add_argument("--days", type=int, default=180)
+    start.add_argument("--parameters")
+    start.add_argument("--run-id")
+    start.add_argument("--open-report", action="store_true")
+    study = commands.add_parser("prepare-study", help="Reserve 60/20/20 chronological partitions and export only training analysis")
+    study.add_argument("--data", required=True)
+    study.add_argument("--parameters")
+    study.add_argument("--run-id", required=True)
+    for name, help_text in (("validate", "Compare a training-bound candidate on the middle 20%%"),
+                            ("holdout", "Evaluate a fixed validated candidate once on the final 20%%")):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("--data", required=True)
+        command.add_argument("--study", required=True)
+        command.add_argument("--proposal", required=True)
+        if name == "validate":
+            command.add_argument("--run-id", required=True)
+        else:
+            command.add_argument("--validation", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "demo":
@@ -211,7 +352,58 @@ def main(argv=None):
             validate_identifier(args.run_id)
             value = compare_candidate(load_json(args.data), load_json(args.report), load_json(args.proposal))
             _paths(write_bundle("comparisons", args.run_id, {".json": _json(value)}))
+        elif args.command == "history":
+            from .market_data import download_history
+            validate_identifier(args.run_id)
+            start, end = parse_utc_date(args.start), parse_utc_date(args.end)
+            # Avoid consuming network requests for an output identifier already in use.
+            output_dir = ensure_directory("datasets")
+            if any((output_dir / (args.run_id + suffix)).exists() or
+                   (output_dir / (args.run_id + suffix)).is_symlink() for suffix in (".json", ".source.json")):
+                raise ResearchWorkflowError("Dataset identifier already exists; use a new --run-id.")
+            dataset, source = download_history(args.symbol, args.interval, start, end, args.run_id)
+            _paths(write_bundle("datasets", args.run_id, {".json": _json(dataset), ".source.json": _json(source)}))
+        elif args.command == "start-study":
+            from .market_data import download_history
+            from .contracts import validate_parameters
+            identifier = args.run_id or ("research_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:8])
+            validate_identifier(identifier)
+            if len(identifier) > 100:
+                raise ResearchWorkflowError("Study identifiers must contain at most 100 characters.")
+            parameters = validate_parameters(load_json(args.parameters) if args.parameters else dict(DEFAULT_PARAMETERS))
+            start_time, end_time = recent_utc_window(args.days)
+            for kind, stem, suffixes in (
+                ("datasets", identifier, (".json", ".source.json")),
+                ("studies", identifier, (".json",)),
+                ("reports", identifier + "_train", (".json", ".md", ".html", ".proposal-template.json")),
+            ):
+                directory = ensure_directory(kind)
+                if any((directory / (stem + suffix)).exists() or (directory / (stem + suffix)).is_symlink()
+                       for suffix in suffixes):
+                    raise ResearchWorkflowError("Study identifier already exists; use a new --run-id.")
+            dataset, provenance = download_history(args.symbol, args.interval, start_time, end_time, identifier)
+            _, paths = save_study(dataset, parameters, identifier, provenance)
+            _paths(paths)
+            if args.open_report:
+                open_local_report(paths["viewer"])
+        elif args.command == "prepare-study":
+            validate_identifier(args.run_id)
+            parameters = load_json(args.parameters) if args.parameters else dict(DEFAULT_PARAMETERS)
+            _, paths = save_study(load_json(args.data), parameters, args.run_id)
+            _paths(paths)
+        elif args.command == "validate":
+            from .validation import validation_comparison
+            validate_identifier(args.run_id)
+            value = validation_comparison(load_json(args.data), load_json(args.study), load_json(args.proposal))
+            _paths(write_bundle("validations", args.run_id, {".json": _json(value)}))
+        elif args.command == "holdout":
+            _, paths = holdout_once(load_json(args.data), load_json(args.study), load_json(args.proposal),
+                                    load_json(args.validation))
+            _paths(paths)
         return 0
+    except (ResearchWorkflowError, MarketDataError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
     except (ValueError, OSError, TypeError, KeyError, OverflowError, RecursionError):
         print("Research command stopped: invalid input, unavailable local service or output conflict.", file=sys.stderr)
         print("No strategy was activated. Check the input schema and use a new output identifier.", file=sys.stderr)

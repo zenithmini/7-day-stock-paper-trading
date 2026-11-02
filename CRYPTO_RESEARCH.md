@@ -20,9 +20,89 @@
 - Ollama 只連接 `127.0.0.1:11434`，停用環境代理、拒絕重新導向與明顯 cloud 模型名稱。
 - AI 只能提出快／慢 SMA 和投入比例，不能改手續費、滑價、本金或執行程式。
 - 原策略與候選採同一份資料及費用假設比較；每個策略各列自己的持幣基準。
+- 公開歷史行情下載器會先讀交易所時間，只接受完整、連續且已收盤的 K 線；分頁不完整時不保存部分資料。
+- 固定按時間切成 60% 訓練、20% 驗證、20% 保留；AI 只取得訓練段報告。
+- 最終保留測試在計算績效前建立使用紀錄；研究名稱或資料名稱變更不會重設相同保留資料的識別。
+- Windows／Mac 啟動入口與可離線開啟的 HTML 歷史研究結果頁。
 
-這個版本只有單一資料集研究，**没有樣本外策略驗證、24 小時行情服務、看板或下單功能**。
+這個版本提供時間切分研究流程，**尚未建立真實市場的獲利證據、24 小時行情服務或下單功能**。
 候選結果一律 `promotion_allowed: false`，不會自動啟用或改動原股票帳本。
+
+## 先開啟真實行情研究流程
+
+解壓縮完整專案後，Windows 11 雙擊 `開始量化研究.bat`，Mac 執行 `開始量化研究.command`。
+若 Mac 壓縮包沒有保留執行權限，可在專案目錄使用 `bash 開始量化研究.command`。
+需要 Python 3.11+ 與網路；不需幣安帳戶或 API 密鑰。也可在專案根目錄執行：
+
+```sh
+python -B -m crypto_research start-study --symbol BTCUSDT --interval 15m --days 180 --open-report
+```
+
+它會下載最近 180 個完整 UTC 日、共 17,280 根 15 分鐘 K 線，切成訓練 10,368 根、驗證 3,456 根、
+保留 3,456 根，再開啟本機 HTML 頁面。BTCUSDT 只是工程示例，不是買入建議。
+研究編號自動產生，所有結果放在 `.local/crypto-research/`，不會上傳雲端。
+頁面只顯示訓練段績效、各段時間及可複製的 AI 提示；不是即時行情看板。
+
+`--days` 可指定 7 至 365 個完整 UTC 日；下載仍受最多 100,000 根限制，例如 1 分鐘資料不能一次取 180 天。
+其他初始成本與策略假設可透過 `--parameters <local-json>` 設定，格式見下方。
+資料不足以涵蓋指定區間、缺 K 線、重複、未收盤、HTTP 418／429 或連線失敗會停止；不重試、不補造資料。
+下載使用固定 `https://data-api.binance.vision`，只允許公開時間及 K 線 GET 端點，保留 HTTPS 憑證驗證。
+遇到網路問題時請檢查本機 DNS、Python 憑證及服務在所在地的可用性。
+
+**開發驗證限制**：此開發環境無法解析幣安資料主機，實際網路下載未跑通；分頁、資料品質及完整工作流程
+使用離線假回應測試。沒有用人工行情冒充真實行情，也沒有實際執行使用者的本地模型。
+啟動檔需在使用者的 Windows／Mac 上完成實際操作驗證。
+
+## 指定歷史期間與分段研究
+
+若要使用固定期間，可分開執行。所有日期都使用 **UTC**；`--end` 是不包含在內的結束日期：
+
+```sh
+python -B -m crypto_research history --symbol BTCUSDT --interval 15m --start 2026-05-01 --end 2026-11-01 --run-id btc_history01
+python -B -m crypto_research prepare-study --data .local/crypto-research/datasets/btc_history01.json --run-id btc_study01
+```
+
+第一個命令保存資料及 `.source.json` 來源紀錄，包含交易所時間、要求區間、根數、請求數與資料指紋。
+第二個命令建立 `.local/crypto-research/studies/btc_study01.json`，並輸出：
+
+- `reports/btc_study01_train.html`：可離線開啟的本機研究結果頁。
+- `reports/btc_study01_train.json`：只使用訓練段的 AI 報告。
+- `reports/btc_study01_train.md`：人工交給 ChatGPT 的提示。
+- `reports/btc_study01_train.proposal-template.json`：候選範本。
+
+將訓練提示交給本地模型或 ChatGPT，候選必須綁定 `btc_study01_train` 這份報告的 ID 與指紋。
+不要先用整份資料做 `report` 再交給 AI，也不要把後面的驗證／保留行情提供給 AI，否則會破壞這次切分的目的。
+
+```sh
+python -B -m crypto_research local-review --report .local/crypto-research/reports/btc_study01_train.json --model qwen3:8b
+```
+
+或把 ChatGPT 回覆的純 JSON 存成 `.local/crypto-research/manual-proposal.json`，再匯入：
+
+```sh
+python -B -m crypto_research import-proposal --report .local/crypto-research/reports/btc_study01_train.json --proposal .local/crypto-research/manual-proposal.json
+```
+
+以下假設候選 ID 是 `candidate01`，先比較中間 20%：
+
+```sh
+python -B -m crypto_research validate --data .local/crypto-research/datasets/btc_history01.json --study .local/crypto-research/studies/btc_study01.json --proposal .local/crypto-research/candidates/candidate01.json --run-id validation01
+```
+
+評估淨報酬、回撤、交易數、成本與各自的持幣基準後，固定一個候選，才執行最後 20%：
+
+```sh
+python -B -m crypto_research holdout --data .local/crypto-research/datasets/btc_history01.json --study .local/crypto-research/studies/btc_study01.json --proposal .local/crypto-research/candidates/candidate01.json --validation .local/crypto-research/validations/validation01.json
+```
+
+保留測試會重新計算對應的驗證結果，確認資料、研究、候選和已存紀錄一致，再先寫入
+`holdouts/<holdout_key>.claim.json`。同一保留段不能再透過 CLI 重測；更換研究名稱、資料名稱、來源標籤或本金
+也不會重設這個識別。若計算或匯出途中失敗，該使用紀錄仍保留，不能拿同一段重新調參。
+成功的完整結果存為 `holdouts/<holdout_key>.json`。
+
+這是本機流程的防誤用措施；持有原始檔案的人仍可自行讀取或編寫程式分析，不能保證資料從未被看過。
+各段各自重設本金與 SMA 暖機，期末平倉，不把上一段持倉帶入下一段。它目前不是連續持倉的滾動驗證。
+最低 `slow_window + 2` 根只是計算需求，不代表統計樣本足夠；重複選擇驗證段最佳候選仍可能過度配適。
 
 ## Windows 11／macOS 先試跑
 
@@ -88,8 +168,8 @@ python -B -m crypto_research local-review --report .local/crypto-research/report
 
 ## 匯入自己的歷史資料
 
-`report --data <path>` 只讀本機檔案。目前沒有交易所自動下載器。
-公開行情與 API 整合會在下一階段加入；不要把既有 Stocks 查詢當作 crypto 資料來源。
+`report --data <path>` 仍可分析單一完整本機資料集；它不會替你保留獨立測試期。
+新的研究流程請先用 `history`／`start-study` 和 `prepare-study`，不要把既有 Stocks 查詢當作 crypto 資料來源。
 
 資料 JSON 的所有欄位都必填；時間使用 **Unix epoch 秒，不是毫秒**。
 `interval_seconds` 支援 60、300、900、3600；各根時間必須對齊間隔且連續，最多 100,000 根。
@@ -139,8 +219,8 @@ SHA-256 用於關聯／重現資料，不是數位簽章，也不證明資料真
 
 後續實作按以下順序：
 
-1. **資料層**：加密貨幣公開歷史／即時行情、事件时间與收盤確認、限流、斷線復原及缺漏品質報告。
-2. **獨立驗證**：按時間分開訓練、驗證及封存測試期；滾動測試；紀錄試過的候選數，防止反覆選到偶然好成績。
+1. **資料層**：歷史下載、收盤及完整性檢查已加入；下一步是在使用者電腦驗證真實下載，增加即時行情與斷線復原。
+2. **獨立驗證**：固定時間切分與一次性保留測試已加入；下一步是滾動測試與試驗登錄，紀錄試過的候選數。
 3. **穩健性比較**：增加成本、小幅改參數、不同市場階段與不同資料期；一起檢查報酬、回撤、樣本及基準表現。
 4. **24 小時模擬**：版本可追溯、斷線後不補造交易、即時風控與看板；AI 延遲或不可用時由固定程式維持管理。
 5. **策略晉級**：事先訂定風險與樣本規則，完成獨立驗證及持續模擬才准備後續實盤設計。實盤不在本版範圍。
@@ -154,4 +234,5 @@ AI 能加速研究，但候選是否有效由可重現的測試證據判定。
 - [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs)
 - [OpenAI Responses API 使用方式](https://developers.openai.com/api/docs/guides/text)：供未來選用自動 API 串接時參考。
 - [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)：格式約束仍須配合應用程式驗證。
-- [Binance Spot 市場資料](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)：目前僅規劃，尚未實作下載。
+- [Binance Spot 市場資料](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)。
+- [Binance 公開行情專用端點](https://developers.binance.com/en/docs/products/spot/faqs/market_data_only)：不需要 API 密鑰。
