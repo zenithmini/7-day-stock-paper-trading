@@ -1,6 +1,6 @@
 """Bounded, unauthenticated Binance Spot history reads for local research.
 
-Only the public market-data host is contacted. A download is returned only when
+Only allowlisted official public-data endpoints are contacted. A download is returned only when
 the complete requested interval consists of consecutive bars already closed at
 the exchange server time captured before pagination. No account API, key,
 configuration file, redirect, order or automatic retry is involved.
@@ -8,9 +8,12 @@ configuration file, redirect, order or automatic retry is involved.
 import json
 import math
 import re
+import errno
+import socket
+import ssl
 from datetime import datetime, timezone
 from time import sleep
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -18,6 +21,8 @@ from .contracts import canonical_sha256, validate_dataset, validate_identifier
 
 
 BASE_URL = "https://data-api.binance.vision"
+DEFAULT_MARKET_HOST = "data-api.binance.vision"
+MARKET_HOSTS = (DEFAULT_MARKET_HOST, "api.binance.com")
 INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 REQUEST_TIMEOUT = 15
@@ -29,6 +34,40 @@ _DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)
 
 class MarketDataError(ValueError):
     """A sanitized, actionable public-data download failure."""
+
+    def __init__(self, message, *, kind="data", http_status=None):
+        super().__init__(message)
+        self.kind = kind
+        self.http_status = http_status
+
+
+def _market_url(market_host):
+    if not isinstance(market_host, str) or market_host not in MARKET_HOSTS:
+        raise MarketDataError("Market host must be data-api.binance.vision or api.binance.com.")
+    return "https://" + market_host
+
+
+def connection_error(error, market_host):
+    """Classify transport failures without exposing raw server or proxy output."""
+    _market_url(market_host)
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, socket.gaierror):
+        kind, hint = "dns", "DNS lookup failed; check whether this host resolves on this computer."
+    elif isinstance(reason, ssl.SSLCertVerificationError):
+        kind, hint = "tls_certificate", "Python could not verify the HTTPS certificate. Check Python CA certificates; keep verification enabled."
+    elif isinstance(reason, ssl.SSLError):
+        kind, hint = "tls", "TLS negotiation failed. Check Python/OpenSSL and the network connection."
+    elif isinstance(reason, (TimeoutError, socket.timeout)):
+        kind, hint = "timeout", "The connection timed out. Check reachability and retry later."
+    elif isinstance(reason, ConnectionRefusedError):
+        kind, hint = "connection_refused", "The connection was refused. Check the network or firewall."
+    elif isinstance(reason, (ConnectionResetError, ConnectionAbortedError)):
+        kind, hint = "connection_reset", "The connection was interrupted. Check the network and retry later."
+    elif isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+        kind, hint = "unreachable", "The network or host is unreachable. Check network connectivity."
+    else:
+        kind, hint = "connection", "The connection failed; run diagnose-network to compare the official hosts."
+    return MarketDataError("[" + kind + "] " + market_host + ": " + hint, kind=kind)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -81,10 +120,10 @@ def _integer(value, label, maximum=None):
     return value
 
 
-def _request_json(opener, path, query):
+def _request_json(opener, path, query, *, market_host=DEFAULT_MARKET_HOST):
     if path not in ("/api/v3/time", "/api/v3/klines"):
         raise MarketDataError("Unsupported public market-data endpoint.")
-    url = BASE_URL + path + ("?" + urlencode(query) if query else "")
+    url = _market_url(market_host) + path + ("?" + urlencode(query) if query else "")
     request = Request(url, headers={"Accept": "application/json", "User-Agent": "CryptoResearch/1"},
                       method="GET")
     try:
@@ -92,7 +131,9 @@ def _request_json(opener, path, query):
             if response.geturl() != url:
                 raise MarketDataError("Public market-data redirects are not accepted.")
             if response.getcode() != 200:
-                raise MarketDataError("Public market-data server returned an unsuccessful response.")
+                code = response.getcode() if type(response.getcode()) is int else 0
+                raise MarketDataError("Public market-data HTTP " + str(code) + "; request stopped.",
+                                      kind="rate_limit" if code in (418, 429) else "http", http_status=code)
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE_BYTES:
             raise MarketDataError("Public market-data response exceeds the size limit.")
@@ -105,12 +146,16 @@ def _request_json(opener, path, query):
             suffix = " Retry after at least " + str(int(retry_after)) + " seconds."
         error.close()
         if code in (418, 429):
-            raise MarketDataError("Public market-data HTTP " + str(code) + "; download stopped without retry." + suffix) from None
-        raise MarketDataError("Public market-data HTTP " + str(code) + "; download stopped.") from None
+            raise MarketDataError("Public market-data HTTP " + str(code) + "; download stopped without retry." + suffix,
+                                  kind="rate_limit", http_status=code) from None
+        raise MarketDataError("Public market-data HTTP " + str(code) + "; download stopped.",
+                              kind="http", http_status=code) from None
     except MarketDataError:
         raise
+    except (URLError, OSError) as error:
+        raise connection_error(error, market_host) from None
     except Exception:
-        raise MarketDataError("Public market-data connection failed; check connectivity and regional availability.") from None
+        raise MarketDataError("Public market-data request failed before a valid response was received.", kind="request") from None
 
 
 def _bar(row, expected_open_time, seconds, server_time_ms):
@@ -135,7 +180,36 @@ def _bar(row, expected_open_time, seconds, server_time_ms):
     return output
 
 
-def download_history(symbol, interval, start_time, end_time, dataset_id):
+def _exchange_time(opener, market_host):
+    server = _request_json(opener, "/api/v3/time", {}, market_host=market_host)
+    if not isinstance(server, dict) or set(server) != {"serverTime"}:
+        raise MarketDataError("Exchange server time could not be verified.")
+    return _integer(server["serverTime"], "server time", MAX_EPOCH_SECONDS * 1000)
+
+
+def probe_market_host(market_host):
+    """Verify one closed public kline; never read credentials or change hosts."""
+    _market_url(market_host)
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    server_time_ms = _exchange_time(opener, market_host)
+    seconds = INTERVALS["15m"]
+    end_time = server_time_ms // (seconds * 1000) * seconds
+    if end_time < seconds:
+        raise MarketDataError("Exchange time is too early to verify a closed kline.")
+    start_time = end_time - seconds
+    sleep(0.25)
+    rows = _request_json(opener, "/api/v3/klines", {
+        "symbol": "BTCUSDT", "interval": "15m", "startTime": start_time * 1000,
+        "endTime": end_time * 1000 - 1, "timeZone": "0", "limit": 1,
+    }, market_host=market_host)
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise MarketDataError("Public kline probe did not return one complete bar.")
+    _bar(rows[0], start_time, seconds, server_time_ms)
+    return {"host": market_host, "status": "ok", "server_time_verified": True,
+            "closed_kline_verified": True, "tls_verification": "enabled"}
+
+
+def download_history(symbol, interval, start_time, end_time, dataset_id, *, market_host=DEFAULT_MARKET_HOST):
     """Return ``(normalized_dataset, provenance)`` for UTC ``[start, end)``.
 
     Start/end use integer epoch *seconds*. Binance wire timestamps use
@@ -143,6 +217,7 @@ def download_history(symbol, interval, start_time, end_time, dataset_id):
     later than the server's current open-bar boundary. All caller inputs are
     checked before the first connection. A partial dataset is never returned.
     """
+    _market_url(market_host)
     try:
         validate_identifier(dataset_id)
     except ValueError:
@@ -161,10 +236,7 @@ def download_history(symbol, interval, start_time, end_time, dataset_id):
         raise MarketDataError("Request must contain 1-100000 bars and have end after start.")
 
     opener = build_opener(ProxyHandler({}), _NoRedirect())
-    server = _request_json(opener, "/api/v3/time", {})
-    if not isinstance(server, dict) or set(server) != {"serverTime"}:
-        raise MarketDataError("Exchange server time could not be verified.")
-    server_time_ms = _integer(server["serverTime"], "server time", MAX_EPOCH_SECONDS * 1000)
+    server_time_ms = _exchange_time(opener, market_host)
     last_closed_boundary = server_time_ms // (seconds * 1000) * seconds
     if end_time > last_closed_boundary:
         raise MarketDataError("Requested end includes a bar not yet closed at exchange server time.")
@@ -176,7 +248,7 @@ def download_history(symbol, interval, start_time, end_time, dataset_id):
         rows = _request_json(opener, "/api/v3/klines", {
             "symbol": symbol, "interval": interval, "startTime": cursor * 1000,
             "endTime": end_time * 1000 - 1, "timeZone": "0", "limit": requested,
-        })
+        }, market_host=market_host)
         request_count += 1
         if not isinstance(rows, list) or len(rows) != requested:
             raise MarketDataError("Exchange returned incomplete history; no partial dataset was saved.")
@@ -192,7 +264,7 @@ def download_history(symbol, interval, start_time, end_time, dataset_id):
     except ValueError:
         raise MarketDataError("Downloaded history failed dataset quality checks.") from None
     provenance = {
-        "schema_version": 1, "source": "binance_public_rest", "endpoint": BASE_URL,
+        "schema_version": 1, "source": "binance_public_rest", "endpoint": _market_url(market_host),
         "symbol": symbol, "interval": interval, "dataset_sha256": canonical_sha256(dataset),
         "exchange_server_time_ms": server_time_ms, "requested_start_time": start_time,
         "requested_end_time_exclusive": end_time, "bar_count": len(bars),

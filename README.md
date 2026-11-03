@@ -28,6 +28,25 @@ AI 只提出有限的策略參數，不能修改費用、本金或啟用交易�
 python -B -m crypto_research start-study --symbol BTCUSDT --interval 15m --days 180 --open-report
 ```
 
+### 若顯示行情連線失敗
+
+程式已啟動但無法連到資料主機時，請先執行 Mac 的 `網路診斷.command`，或從專案目錄執行：
+
+```sh
+python -B -m crypto_research diagnose-network
+```
+
+診斷使用同一套 Python，分別檢查兩個固定官方主機的時間與一根已收盤 K 線。
+`dns`、`tls_certificate`、`timeout` 和 HTTP 狀態會分開顯示；不讀取帳戶或密鑰。
+若預設的 `data-api.binance.vision` 無法連線，而 `api.binance.com` 顯示 `ok`，可明確選擇後者：
+
+```sh
+python -B -m crypto_research start-study --market-host api.binance.com --open-report
+```
+
+不會自動切換主機。診斷遇到 418／429 限流或 403／451 存取限制時停止後續主機測試。
+如果是憑證錯誤，應處理 Python CA 憑證，不能停用 HTTPS 憑證驗證。
+
 若只想確認離線流程：
 
 ```sh

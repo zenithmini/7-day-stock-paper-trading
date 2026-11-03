@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .backtest import run_backtest
 from .contracts import DEFAULT_PARAMETERS, canonical_sha256, validate_dataset, validate_identifier
-from .market_data import MarketDataError
+from .market_data import MARKET_HOSTS, MarketDataError
 from .reports import (
     build_report, candidate_parameters, proposal_template, render_markdown,
     validate_proposal, validate_report,
@@ -299,6 +299,7 @@ def main(argv=None):
     history.add_argument("--start", required=True, help="Inclusive UTC date YYYY-MM-DD")
     history.add_argument("--end", required=True, help="Exclusive UTC date YYYY-MM-DD")
     history.add_argument("--run-id", required=True)
+    history.add_argument("--market-host", choices=MARKET_HOSTS, help="Explicit official public-data host; no automatic switching")
     start = commands.add_parser("start-study", help="Download recent public history, prepare a study and show a local training report")
     start.add_argument("--symbol", default="BTCUSDT")
     start.add_argument("--interval", choices=("1m", "5m", "15m", "1h"), default="15m")
@@ -306,6 +307,9 @@ def main(argv=None):
     start.add_argument("--parameters")
     start.add_argument("--run-id")
     start.add_argument("--open-report", action="store_true")
+    start.add_argument("--market-host", choices=MARKET_HOSTS, help="Explicit official public-data host; no automatic switching")
+    diagnostic = commands.add_parser("diagnose-network", help="Check Python HTTPS, official public time and one closed kline per host")
+    diagnostic.add_argument("--json", action="store_true", help="Print a machine-readable diagnostic report")
     study = commands.add_parser("prepare-study", help="Reserve 60/20/20 chronological partitions and export only training analysis")
     study.add_argument("--data", required=True)
     study.add_argument("--parameters")
@@ -361,7 +365,8 @@ def main(argv=None):
             if any((output_dir / (args.run_id + suffix)).exists() or
                    (output_dir / (args.run_id + suffix)).is_symlink() for suffix in (".json", ".source.json")):
                 raise ResearchWorkflowError("Dataset identifier already exists; use a new --run-id.")
-            dataset, source = download_history(args.symbol, args.interval, start, end, args.run_id)
+            host_options = {"market_host": args.market_host} if args.market_host else {}
+            dataset, source = download_history(args.symbol, args.interval, start, end, args.run_id, **host_options)
             _paths(write_bundle("datasets", args.run_id, {".json": _json(dataset), ".source.json": _json(source)}))
         elif args.command == "start-study":
             from .market_data import download_history
@@ -381,11 +386,17 @@ def main(argv=None):
                 if any((directory / (stem + suffix)).exists() or (directory / (stem + suffix)).is_symlink()
                        for suffix in suffixes):
                     raise ResearchWorkflowError("Study identifier already exists; use a new --run-id.")
-            dataset, provenance = download_history(args.symbol, args.interval, start_time, end_time, identifier)
+            host_options = {"market_host": args.market_host} if args.market_host else {}
+            dataset, provenance = download_history(args.symbol, args.interval, start_time, end_time, identifier, **host_options)
             _, paths = save_study(dataset, parameters, identifier, provenance)
             _paths(paths)
             if args.open_report:
                 open_local_report(paths["viewer"])
+        elif args.command == "diagnose-network":
+            from .network_diagnostics import diagnose_network, render_diagnostics
+            diagnosis = diagnose_network()
+            print(json.dumps(diagnosis, ensure_ascii=True, indent=2) if args.json else render_diagnostics(diagnosis))
+            return 0 if diagnosis["any_host_verified"] else 2
         elif args.command == "prepare-study":
             validate_identifier(args.run_id)
             parameters = load_json(args.parameters) if args.parameters else dict(DEFAULT_PARAMETERS)
@@ -401,7 +412,12 @@ def main(argv=None):
                                     load_json(args.validation))
             _paths(paths)
         return 0
-    except (ResearchWorkflowError, MarketDataError) as error:
+    except MarketDataError as error:
+        print(str(error), file=sys.stderr)
+        if error.kind in {"dns", "tls_certificate", "tls", "timeout", "connection_refused", "connection_reset", "unreachable", "connection"}:
+            print("Run: python -B -m crypto_research diagnose-network", file=sys.stderr)
+        return 2
+    except ResearchWorkflowError as error:
         print(str(error), file=sys.stderr)
         return 2
     except (ValueError, OSError, TypeError, KeyError, OverflowError, RecursionError):

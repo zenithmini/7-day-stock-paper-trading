@@ -46,8 +46,37 @@ python -B -m crypto_research start-study --symbol BTCUSDT --interval 15m --days 
 `--days` 可指定 7 至 365 個完整 UTC 日；下載仍受最多 100,000 根限制，例如 1 分鐘資料不能一次取 180 天。
 其他初始成本與策略假設可透過 `--parameters <local-json>` 設定，格式見下方。
 資料不足以涵蓋指定區間、缺 K 線、重複、未收盤、HTTP 418／429 或連線失敗會停止；不重試、不補造資料。
-下載使用固定 `https://data-api.binance.vision`，只允許公開時間及 K 線 GET 端點，保留 HTTPS 憑證驗證。
+下載預設使用 `https://data-api.binance.vision`；可用 `--market-host api.binance.com` 明確選擇另一個官方主機。
+只有這兩個固定主機，以及公開時間／K 線 GET 端點在允許清單內，保留 HTTPS 憑證驗證，不自動切換或重試。
 遇到網路問題時請檢查本機 DNS、Python 憑證及服務在所在地的可用性。
+
+### 網路診斷
+
+Mac 可執行 `網路診斷.command`，或使用：
+
+```sh
+python -B -m crypto_research diagnose-network
+```
+
+這會使用啟動研究的同一套 Python，顯示 Python 版本／路徑、系統預設 CA 路徑是否存在，
+並測試兩個固定官方主機的公開時間與一根已收盤 BTCUSDT K 線。
+它不更改 DNS、代理、憑證或目前行情來源，也不讀取帳戶、密鑰與交易紀錄。
+`--json` 可產生結構化診斷輸出；一般模式可將整段結果貼回對話協助排查。
+
+- `[dns]`：Python 無法解析該主機名稱。
+- `[tls_certificate]`：Python 無法驗證 HTTPS 憑證，需核對該 Python 的 CA 憑證設定。
+- `[tls]`、`[timeout]`、`[connection_refused]`、`[connection_reset]`、`[unreachable]`：分別標示其他 TLS 或連線故障。
+- HTTP 418／429：立即停止，遵守數字格式的 Retry-After，沒有自動重試。
+- HTTP 403／451：顯示存取限制並停止後續診斷主機測試。
+
+如果只有 `api.binance.com` 顯示 `ok`，確認服務在所在地可用後，可明確執行：
+
+```sh
+python -B -m crypto_research start-study --market-host api.binance.com --open-report
+```
+
+來源紀錄會保存實際選擇的官方主機。單次時間／K 線探測成功仍不保證整段歷史下載一定成功。
+憑證錯誤不要改成不驗證憑證；這個程式沒有關閉 TLS 驗證的選項。
 
 **開發驗證限制**：此開發環境無法解析幣安資料主機，實際網路下載未跑通；分頁、資料品質及完整工作流程
 使用離線假回應測試。沒有用人工行情冒充真實行情，也沒有實際執行使用者的本地模型。
@@ -236,3 +265,4 @@ AI 能加速研究，但候選是否有效由可重現的測試證據判定。
 - [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)：格式約束仍須配合應用程式驗證。
 - [Binance Spot 市場資料](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)。
 - [Binance 公開行情專用端點](https://developers.binance.com/en/docs/products/spot/faqs/market_data_only)：不需要 API 密鑰。
+- [Binance REST API 官方主機清單](https://developers.binance.com/en/docs/products/spot/rest-api)。

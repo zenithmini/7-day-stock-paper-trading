@@ -13,7 +13,8 @@ if errorlevel 1 (
 set "research_exit_code=%errorlevel%"
 if not "%research_exit_code%"=="0" (
     echo.
-    echo 研究未完成。請確認 Python 3.11 或更新版本已安裝，並查看上方訊息。
+    echo 研究未完成，請依上方錯誤訊息處理。
+    echo 連線問題可在專案目錄執行：python -B -m crypto_research diagnose-network
 )
 echo.
 pause
